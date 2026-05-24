@@ -5,6 +5,7 @@
 // PIN pad, spinning logo), then screens (Splash, Onboard, Create, Import,
 // SetPin, Lock, Home, Receive, Send, Profile).
 
+import 'dart:convert';
 import 'dart:math' as math;
 
 import 'package:bip32/bip32.dart' as bip32;
@@ -32,6 +33,13 @@ const List<String> kPolygonRpcs = [
   'https://polygon.llamarpc.com',
 ];
 const int kPolygonChainId = 137;
+
+// Tchipa backend (shared with the VCC app). Hosts the gas-loan endpoint that
+// drips a little POL to a USDT-funded wallet so it can pay gas; the app repays
+// the value in USDT in the same send flow.
+const String kApiBase = 'https://api.tchipa.co.uk';
+// Below this POL balance a wallet "needs" a gas loan before it can send.
+const double kGasThresholdPol = 0.02;
 
 // USDT on Polygon (PoS), 6 decimals.
 const String kUsdtAddress = '0xc2132D05D31c914a87C6611C10748AEb04B58e8F';
@@ -213,6 +221,7 @@ class WalletService {
   Future<String> sendUsdt({
     required String toHex,
     required BigInt amountWei,
+    int? nonce,
   }) async {
     if (_credentials == null) {
       throw StateError('Wallet non chargée.');
@@ -224,10 +233,47 @@ class WalletService {
       contract: contract,
       function: fn,
       parameters: [to, amountWei],
+      nonce: nonce,
     );
     return _rpc(
       (c) => c.sendTransaction(_credentials!, tx, chainId: kPolygonChainId),
     );
+  }
+
+  // Next nonce for this wallet — used to order the user's send and the gas
+  // repayment back-to-back without waiting for the first to be mined.
+  Future<int> txCount() async =>
+      _rpc((c) => c.getTransactionCount(_address!));
+
+  // Asks the backend to drip POL for gas. Returns the parsed JSON; throws on
+  // a non-200 with the server's error message.
+  Future<Map<String, dynamic>> requestGasLoan() async {
+    final resp = await http
+        .post(
+          Uri.parse('$kApiBase/gas/loan'),
+          headers: {'Content-Type': 'application/json'},
+          body: jsonEncode({'address': addressHex}),
+        )
+        .timeout(const Duration(seconds: 30));
+    final data = jsonDecode(resp.body) as Map<String, dynamic>;
+    if (resp.statusCode != 200) {
+      throw Exception(data['error'] ?? 'Échec du prêt de gas.');
+    }
+    return data;
+  }
+
+  // Polls until the POL balance reaches [minPol] or the timeout elapses.
+  Future<void> waitForPol(
+    double minPol, {
+    Duration timeout = const Duration(seconds: 90),
+  }) async {
+    final target = parseAmount(minPol.toString(), 18);
+    final deadline = DateTime.now().add(timeout);
+    while (DateTime.now().isBefore(deadline)) {
+      if (await polBalance() >= target) return;
+      await Future.delayed(const Duration(seconds: 4));
+    }
+    throw StateError('Le POL de gas n\'est pas arrivé à temps. Réessayez.');
   }
 
   DeployedContract _erc20() => DeployedContract(
@@ -1661,6 +1707,7 @@ class _SendScreenState extends State<SendScreen> {
   final TextEditingController _amtCtrl = TextEditingController();
   bool _sending = false;
   String? _err;
+  String? _status;
 
   @override
   void dispose() {
@@ -1673,6 +1720,7 @@ class _SendScreenState extends State<SendScreen> {
     setState(() {
       _sending = true;
       _err = null;
+      _status = null;
     });
     try {
       final to = _toCtrl.text.trim();
@@ -1681,17 +1729,63 @@ class _SendScreenState extends State<SendScreen> {
       if (amount <= BigInt.zero) {
         throw const FormatException('Le montant doit être supérieur à 0.');
       }
-      final hash = await WalletService.instance.sendUsdt(
-        toHex: to,
-        amountWei: amount,
-      );
+      final svc = WalletService.instance;
+
+      // Gas check: an ERC-20 transfer needs POL. If the wallet has none, ask
+      // the backend to drip a little, then repay its value in USDT.
+      final polWei = await svc.polBalance();
+      final polThreshold =
+          WalletService.parseAmount(kGasThresholdPol.toString(), 18);
+
+      String? repayTo;
+      BigInt feeWei = BigInt.zero;
+      bool loaned = false;
+
+      if (polWei < polThreshold) {
+        setState(() => _status = 'Pas de POL pour le gas — Tchipa l\'avance…');
+        final loan = await svc.requestGasLoan();
+        if (loan['funded'] == true) {
+          loaned = true;
+          feeWei = WalletService.parseAmount(
+              loan['feeUsdt'].toString(), kUsdtDecimals);
+          repayTo = loan['repayTo'] as String?;
+          final usdtWei = await svc.usdtBalance();
+          if (usdtWei < amount + feeWei) {
+            throw Exception(
+                'Solde USDT insuffisant : il faut couvrir le montant + ${loan['feeUsdt']} USDT de frais de gas.');
+          }
+          setState(() => _status = 'Réception du POL de gas…');
+          await svc.waitForPol(kGasThresholdPol);
+        }
+      }
+
+      // Order the two transfers with explicit nonces so they don't collide.
+      final nonce = await svc.txCount();
+      setState(() => _status = 'Envoi de la transaction…');
+      final hash =
+          await svc.sendUsdt(toHex: to, amountWei: amount, nonce: nonce);
+
+      if (loaned && repayTo != null && feeWei > BigInt.zero) {
+        setState(() => _status = 'Remboursement du gas…');
+        try {
+          await svc.sendUsdt(
+              toHex: repayTo, amountWei: feeWei, nonce: nonce + 1);
+        } catch (_) {
+          // Best-effort: the user's transfer already went through.
+        }
+      }
+
       if (!mounted) return;
       Navigator.pop(context);
       showToast(context, 'Transaction envoyée : ${hash.substring(0, 14)}…');
     } catch (e) {
       setState(() {
         _sending = false;
-        _err = e.toString().replaceFirst('FormatException: ', '');
+        _status = null;
+        _err = e
+            .toString()
+            .replaceFirst('FormatException: ', '')
+            .replaceFirst('Exception: ', '');
       });
     }
   }
@@ -1743,7 +1837,8 @@ class _SendScreenState extends State<SendScreen> {
                     SizedBox(width: 10),
                     Expanded(
                       child: Text(
-                        'Les frais de gas sont payés en POL. Sans POL, la transaction échouera.',
+                        'Le gas se paie en POL. Si vous n\'en avez pas, Tchipa '
+                        'l\'avance et prélève 0.40 USDT de frais.',
                         style: TextStyle(
                             color: kMuted, fontSize: 12.5, height: 1.4),
                       ),
@@ -1752,11 +1847,28 @@ class _SendScreenState extends State<SendScreen> {
                 ),
               ),
               const Spacer(),
+              if (_status != null) ...[
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    const SizedBox(
+                      height: 14,
+                      width: 14,
+                      child: CircularProgressIndicator(
+                          strokeWidth: 2, color: kAccent),
+                    ),
+                    const SizedBox(width: 10),
+                    Text(_status!,
+                        style: const TextStyle(color: kMuted, fontSize: 13)),
+                  ],
+                ),
+                const SizedBox(height: 12),
+              ],
               PrimaryButton(
                 label: 'Envoyer',
                 icon: Icons.arrow_upward,
                 busy: _sending,
-                onPressed: _send,
+                onPressed: _sending ? null : _send,
               ),
             ],
           ),
