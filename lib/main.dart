@@ -4,6 +4,8 @@
 // Sections: constants, WalletService, screens (Splash, Onboard, Create, Import,
 // Home, Receive, Send).
 
+import 'dart:math' as math;
+
 import 'package:bip32/bip32.dart' as bip32;
 import 'package:bip39/bip39.dart' as bip39;
 import 'package:flutter/material.dart';
@@ -266,6 +268,66 @@ class _SplashScreenState extends State<SplashScreen> {
 }
 
 // ---------------------------------------------------------------------------
+// SpinningLogo — Tchipa "T" mark that pivots on its own vertical axis (rotateY
+// with a touch of perspective), so it turns side-to-side like a coin, NOT a
+// top-to-bottom flip.
+// ---------------------------------------------------------------------------
+
+class SpinningLogo extends StatefulWidget {
+  const SpinningLogo({super.key, this.size = 120});
+  final double size;
+  @override
+  State<SpinningLogo> createState() => _SpinningLogoState();
+}
+
+class _SpinningLogoState extends State<SpinningLogo>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _ctrl;
+
+  @override
+  void initState() {
+    super.initState();
+    _ctrl = AnimationController(
+      vsync: this,
+      duration: const Duration(seconds: 6),
+    )..repeat();
+  }
+
+  @override
+  void dispose() {
+    _ctrl.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: widget.size,
+      height: widget.size,
+      decoration: const BoxDecoration(
+        shape: BoxShape.circle,
+        boxShadow: [
+          BoxShadow(color: Color(0x447C5CFF), blurRadius: 40, spreadRadius: 4),
+        ],
+      ),
+      child: AnimatedBuilder(
+        animation: _ctrl,
+        builder: (_, child) {
+          return Transform(
+            alignment: Alignment.center,
+            transform: Matrix4.identity()
+              ..setEntry(3, 2, 0.0015) // subtle perspective
+              ..rotateY(_ctrl.value * 2 * math.pi),
+            child: child,
+          );
+        },
+        child: Image.asset('assets/tchipa_logo.png', fit: BoxFit.contain),
+      ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
 // OnboardScreen — Create or Import.
 // ---------------------------------------------------------------------------
 
@@ -281,23 +343,7 @@ class OnboardScreen extends StatelessWidget {
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
               const SizedBox(height: 48),
-              Container(
-                width: 84,
-                height: 84,
-                decoration: BoxDecoration(
-                  color: kAccent,
-                  borderRadius: BorderRadius.circular(20),
-                ),
-                alignment: Alignment.center,
-                child: const Text(
-                  'T',
-                  style: TextStyle(
-                    color: Colors.white,
-                    fontSize: 48,
-                    fontWeight: FontWeight.w800,
-                  ),
-                ),
-              ),
+              const Center(child: SpinningLogo(size: 128)),
               const SizedBox(height: 24),
               const Text(
                 'Tchipa Wallet',
