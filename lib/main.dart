@@ -1,8 +1,9 @@
 // Tchipa Wallet — self-custody USDT/Polygon wallet.
 //
 // Single-file architecture, mirrors the convention of the main Tchipa app.
-// Sections: constants, WalletService, screens (Splash, Onboard, Create, Import,
-// Home, Receive, Send).
+// Sections: constants, BioAuth, WalletService, shared UI (buttons, cards,
+// PIN pad, spinning logo), then screens (Splash, Onboard, Create, Import,
+// SetPin, Lock, Home, Receive, Send, Profile).
 
 import 'dart:math' as math;
 
@@ -12,6 +13,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:http/http.dart' as http;
+import 'package:local_auth/local_auth.dart';
 import 'package:qr_flutter/qr_flutter.dart';
 import 'package:web3dart/web3dart.dart';
 
@@ -19,7 +21,16 @@ import 'package:web3dart/web3dart.dart';
 // Constants
 // ---------------------------------------------------------------------------
 
-const String kPolygonRpc = 'https://polygon-rpc.com';
+// Polygon RPC endpoints, tried in order with automatic fallback. The public
+// `polygon-rpc.com` is unreliable — it intermittently returns non-JSON
+// rate-limit pages that crash web3dart with
+// "type 'String' is not a subtype of type 'int' of 'index'", so it is NOT used.
+const List<String> kPolygonRpcs = [
+  'https://polygon-bor-rpc.publicnode.com',
+  'https://1rpc.io/matic',
+  'https://polygon.drpc.org',
+  'https://polygon.llamarpc.com',
+];
 const int kPolygonChainId = 137;
 
 // USDT on Polygon (PoS), 6 decimals.
@@ -31,16 +42,62 @@ const String kHdPath = "m/44'/60'/0'/0/0";
 
 // Secure storage keys.
 const String kStorageMnemonic = 'tchipa_wallet_mnemonic_v1';
+const String kStoragePin = 'tchipa_wallet_pin_v1';
+const String kStorageBio = 'tchipa_wallet_bio_v1';
 
 // Minimal ERC-20 ABI (balanceOf, transfer).
 const String kErc20Abi =
     '[{"constant":true,"inputs":[{"name":"owner","type":"address"}],"name":"balanceOf","outputs":[{"name":"","type":"uint256"}],"type":"function"},'
     '{"constant":false,"inputs":[{"name":"to","type":"address"},{"name":"value","type":"uint256"}],"name":"transfer","outputs":[{"name":"","type":"bool"}],"type":"function"}]';
 
-const Color kBg = Color(0xFF0E1116);
-const Color kCard = Color(0xFF181C24);
+// ── Palette (Dark / OLED) ──────────────────────────────────────────────────
+const Color kBg = Color(0xFF0B0E13);
+const Color kCard = Color(0xFF161A23);
+const Color kCardHi = Color(0xFF1E2330);
+const Color kStroke = Color(0xFF262C3A);
 const Color kAccent = Color(0xFF7C5CFF);
+const Color kAccentDeep = Color(0xFF5B3FE0);
+const Color kGold = Color(0xFFF5B544); // value / USDT trust accent
+const Color kGreen = Color(0xFF35C28E);
+const Color kRed = Color(0xFFFF5C6C);
 const Color kMuted = Color(0xFF8A93A6);
+
+const LinearGradient kAccentGrad = LinearGradient(
+  begin: Alignment.topLeft,
+  end: Alignment.bottomRight,
+  colors: [kAccent, kAccentDeep],
+);
+
+// ---------------------------------------------------------------------------
+// BioAuth — thin wrapper around local_auth.
+// ---------------------------------------------------------------------------
+
+class BioAuth {
+  static final LocalAuthentication _auth = LocalAuthentication();
+
+  static Future<bool> available() async {
+    try {
+      return await _auth.isDeviceSupported() &&
+          await _auth.canCheckBiometrics;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  static Future<bool> authenticate(String reason) async {
+    try {
+      return await _auth.authenticate(
+        localizedReason: reason,
+        options: const AuthenticationOptions(
+          stickyAuth: true,
+          biometricOnly: true,
+        ),
+      );
+    } catch (_) {
+      return false;
+    }
+  }
+}
 
 // ---------------------------------------------------------------------------
 // WalletService — holds the active EVM account, talks to Polygon.
@@ -51,7 +108,9 @@ class WalletService {
   static final WalletService instance = WalletService._();
 
   final FlutterSecureStorage _storage = const FlutterSecureStorage();
-  final Web3Client _client = Web3Client(kPolygonRpc, http.Client());
+
+  // Index of the last RPC endpoint that worked — tried first next time.
+  int _rpcIdx = 0;
 
   EthPrivateKey? _credentials;
   EthereumAddress? _address;
@@ -60,6 +119,7 @@ class WalletService {
   bool get isLoaded => _credentials != null;
   EthereumAddress? get address => _address;
   String? get mnemonic => _mnemonic;
+  String get addressHex => _address?.hexEip55 ?? '';
 
   Future<bool> hasStoredWallet() async {
     final v = await _storage.read(key: kStorageMnemonic);
@@ -84,6 +144,8 @@ class WalletService {
 
   Future<void> wipe() async {
     await _storage.delete(key: kStorageMnemonic);
+    await _storage.delete(key: kStoragePin);
+    await _storage.delete(key: kStorageBio);
     _credentials = null;
     _address = null;
     _mnemonic = null;
@@ -102,9 +164,39 @@ class WalletService {
     _mnemonic = mnemonic;
   }
 
+  // ── PIN / biometric lock ──────────────────────────────────────────────
+  Future<bool> hasPin() async =>
+      (await _storage.read(key: kStoragePin))?.isNotEmpty ?? false;
+  Future<void> setPin(String pin) => _storage.write(key: kStoragePin, value: pin);
+  Future<bool> verifyPin(String pin) async =>
+      (await _storage.read(key: kStoragePin)) == pin;
+  Future<bool> bioEnabled() async =>
+      (await _storage.read(key: kStorageBio)) == '1';
+  Future<void> setBioEnabled(bool v) =>
+      _storage.write(key: kStorageBio, value: v ? '1' : '0');
+
+  // ── Chain reads / writes (with RPC fallback) ──────────────────────────
+  Future<T> _rpc<T>(Future<T> Function(Web3Client) op) async {
+    Object? lastErr;
+    for (var i = 0; i < kPolygonRpcs.length; i++) {
+      final idx = (_rpcIdx + i) % kPolygonRpcs.length;
+      final client = Web3Client(kPolygonRpcs[idx], http.Client());
+      try {
+        final result = await op(client).timeout(const Duration(seconds: 15));
+        _rpcIdx = idx; // remember the one that worked
+        return result;
+      } catch (e) {
+        lastErr = e;
+      } finally {
+        client.dispose();
+      }
+    }
+    throw lastErr ?? StateError('Tous les RPC Polygon ont échoué.');
+  }
+
   Future<BigInt> polBalance() async {
     if (_address == null) return BigInt.zero;
-    final v = await _client.getBalance(_address!);
+    final v = await _rpc((c) => c.getBalance(_address!));
     return v.getInWei;
   }
 
@@ -112,10 +204,8 @@ class WalletService {
     if (_address == null) return BigInt.zero;
     final contract = _erc20();
     final fn = contract.function('balanceOf');
-    final res = await _client.call(
-      contract: contract,
-      function: fn,
-      params: [_address!],
+    final res = await _rpc(
+      (c) => c.call(contract: contract, function: fn, params: [_address!]),
     );
     return res.first as BigInt;
   }
@@ -135,10 +225,8 @@ class WalletService {
       function: fn,
       parameters: [to, amountWei],
     );
-    return _client.sendTransaction(
-      _credentials!,
-      tx,
-      chainId: kPolygonChainId,
+    return _rpc(
+      (c) => c.sendTransaction(_credentials!, tx, chainId: kPolygonChainId),
     );
   }
 
@@ -181,98 +269,155 @@ class WalletService {
     }
     return whole * BigInt.from(10).pow(decimals) + frac;
   }
+
+  static String shortAddress(String addr) => addr.length > 12
+      ? '${addr.substring(0, 6)}…${addr.substring(addr.length - 4)}'
+      : addr;
 }
 
 // ---------------------------------------------------------------------------
-// App entrypoint
+// Shared UI
 // ---------------------------------------------------------------------------
 
-void main() => runApp(const TchipaWalletApp());
+void showToast(BuildContext context, String msg) {
+  ScaffoldMessenger.of(context)
+    ..hideCurrentSnackBar()
+    ..showSnackBar(
+      SnackBar(
+        content: Text(msg),
+        behavior: SnackBarBehavior.floating,
+        backgroundColor: kCardHi,
+        shape:
+            RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+        margin: const EdgeInsets.all(16),
+      ),
+    );
+}
 
-class TchipaWalletApp extends StatelessWidget {
-  const TchipaWalletApp({super.key});
+BoxDecoration cardDecoration({Color? color}) => BoxDecoration(
+      color: color ?? kCard,
+      borderRadius: BorderRadius.circular(18),
+      border: Border.all(color: kStroke),
+    );
+
+// Primary CTA — gradient pill with optional busy spinner.
+class PrimaryButton extends StatelessWidget {
+  const PrimaryButton({
+    super.key,
+    required this.label,
+    required this.onPressed,
+    this.busy = false,
+    this.icon,
+  });
+  final String label;
+  final VoidCallback? onPressed;
+  final bool busy;
+  final IconData? icon;
 
   @override
   Widget build(BuildContext context) {
-    final base = ThemeData.dark(useMaterial3: true);
-    return MaterialApp(
-      title: 'Tchipa Wallet',
-      debugShowCheckedModeBanner: false,
-      theme: base.copyWith(
-        scaffoldBackgroundColor: kBg,
-        colorScheme: base.colorScheme.copyWith(
-          primary: kAccent,
-          surface: kCard,
+    final enabled = onPressed != null && !busy;
+    return Opacity(
+      opacity: enabled ? 1 : 0.5,
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          gradient: kAccentGrad,
+          borderRadius: BorderRadius.circular(16),
+          boxShadow: enabled
+              ? const [
+                  BoxShadow(
+                    color: Color(0x557C5CFF),
+                    blurRadius: 22,
+                    offset: Offset(0, 8),
+                  ),
+                ]
+              : null,
         ),
-        appBarTheme: const AppBarTheme(
-          backgroundColor: kBg,
-          elevation: 0,
-          centerTitle: true,
-        ),
-        elevatedButtonTheme: ElevatedButtonThemeData(
-          style: ElevatedButton.styleFrom(
-            backgroundColor: kAccent,
-            foregroundColor: Colors.white,
-            minimumSize: const Size.fromHeight(52),
-            shape: RoundedRectangleBorder(
-              borderRadius: BorderRadius.circular(14),
+        child: Material(
+          color: Colors.transparent,
+          child: InkWell(
+            borderRadius: BorderRadius.circular(16),
+            onTap: enabled ? onPressed : null,
+            child: SizedBox(
+              height: 56,
+              child: Center(
+                child: busy
+                    ? const SizedBox(
+                        height: 22,
+                        width: 22,
+                        child: CircularProgressIndicator(
+                          color: Colors.white,
+                          strokeWidth: 2.4,
+                        ),
+                      )
+                    : Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          if (icon != null) ...[
+                            Icon(icon, color: Colors.white, size: 20),
+                            const SizedBox(width: 8),
+                          ],
+                          Text(
+                            label,
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontSize: 16,
+                              fontWeight: FontWeight.w700,
+                            ),
+                          ),
+                        ],
+                      ),
+              ),
             ),
-            textStyle:
-                const TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
           ),
         ),
       ),
-      home: const SplashScreen(),
     );
   }
 }
 
-// ---------------------------------------------------------------------------
-// SplashScreen — decide route based on stored wallet.
-// ---------------------------------------------------------------------------
-
-class SplashScreen extends StatefulWidget {
-  const SplashScreen({super.key});
-  @override
-  State<SplashScreen> createState() => _SplashScreenState();
-}
-
-class _SplashScreenState extends State<SplashScreen> {
-  @override
-  void initState() {
-    super.initState();
-    _route();
-  }
-
-  Future<void> _route() async {
-    final svc = WalletService.instance;
-    final has = await svc.hasStoredWallet();
-    if (has) {
-      await svc.loadFromStorage();
-    }
-    if (!mounted) return;
-    Navigator.of(context).pushReplacement(
-      MaterialPageRoute(
-        builder: (_) => has ? const HomeScreen() : const OnboardScreen(),
-      ),
-    );
-  }
+class GhostButton extends StatelessWidget {
+  const GhostButton({
+    super.key,
+    required this.label,
+    required this.onPressed,
+    this.icon,
+  });
+  final String label;
+  final VoidCallback? onPressed;
+  final IconData? icon;
 
   @override
   Widget build(BuildContext context) {
-    return const Scaffold(
-      backgroundColor: kBg,
-      body: Center(child: CircularProgressIndicator(color: kAccent)),
+    return SizedBox(
+      height: 56,
+      child: OutlinedButton(
+        onPressed: onPressed,
+        style: OutlinedButton.styleFrom(
+          foregroundColor: Colors.white,
+          side: const BorderSide(color: kStroke),
+          shape:
+              RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            if (icon != null) ...[
+              Icon(icon, size: 20),
+              const SizedBox(width: 8),
+            ],
+            Text(label,
+                style:
+                    const TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
+          ],
+        ),
+      ),
     );
   }
 }
 
-// ---------------------------------------------------------------------------
 // SpinningLogo — Tchipa "T" mark that pivots on its own vertical axis (rotateY
-// with a touch of perspective), so it turns side-to-side like a coin, NOT a
-// top-to-bottom flip.
-// ---------------------------------------------------------------------------
-
+// with a touch of perspective): turns side-to-side like a coin, NOT a flip.
 class SpinningLogo extends StatefulWidget {
   const SpinningLogo({super.key, this.size = 120});
   final double size;
@@ -307,7 +452,7 @@ class _SpinningLogoState extends State<SpinningLogo>
       decoration: const BoxDecoration(
         shape: BoxShape.circle,
         boxShadow: [
-          BoxShadow(color: Color(0x447C5CFF), blurRadius: 40, spreadRadius: 4),
+          BoxShadow(color: Color(0x447C5CFF), blurRadius: 44, spreadRadius: 6),
         ],
       ),
       child: AnimatedBuilder(
@@ -327,6 +472,180 @@ class _SpinningLogoState extends State<SpinningLogo>
   }
 }
 
+// PIN dots indicator.
+class PinDots extends StatelessWidget {
+  const PinDots({super.key, required this.length, required this.filled});
+  final int length;
+  final int filled;
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.center,
+      children: List.generate(length, (i) {
+        final on = i < filled;
+        return AnimatedContainer(
+          duration: const Duration(milliseconds: 150),
+          margin: const EdgeInsets.symmetric(horizontal: 9),
+          width: 16,
+          height: 16,
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            color: on ? kAccent : Colors.transparent,
+            border: Border.all(color: on ? kAccent : kMuted, width: 1.6),
+          ),
+        );
+      }),
+    );
+  }
+}
+
+// Numeric keypad with optional biometric key (bottom-left).
+class PinKeypad extends StatelessWidget {
+  const PinKeypad({
+    super.key,
+    required this.onDigit,
+    required this.onBackspace,
+    this.onBio,
+  });
+  final ValueChanged<String> onDigit;
+  final VoidCallback onBackspace;
+  final VoidCallback? onBio;
+
+  @override
+  Widget build(BuildContext context) {
+    Widget key(Widget child, VoidCallback? onTap) => Material(
+          color: Colors.transparent,
+          child: InkResponse(
+            onTap: onTap,
+            radius: 44,
+            child: SizedBox(height: 72, child: Center(child: child)),
+          ),
+        );
+    Widget digit(String d) => key(
+          Text(d,
+              style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 28,
+                  fontWeight: FontWeight.w600)),
+          () => onDigit(d),
+        );
+    return Column(
+      children: [
+        Row(children: [
+          Expanded(child: digit('1')),
+          Expanded(child: digit('2')),
+          Expanded(child: digit('3')),
+        ]),
+        Row(children: [
+          Expanded(child: digit('4')),
+          Expanded(child: digit('5')),
+          Expanded(child: digit('6')),
+        ]),
+        Row(children: [
+          Expanded(child: digit('7')),
+          Expanded(child: digit('8')),
+          Expanded(child: digit('9')),
+        ]),
+        Row(children: [
+          Expanded(
+            child: onBio != null
+                ? key(const Icon(Icons.fingerprint, color: kAccent, size: 30),
+                    onBio)
+                : const SizedBox(height: 72),
+          ),
+          Expanded(child: digit('0')),
+          Expanded(
+            child: key(
+              const Icon(Icons.backspace_outlined, color: kMuted, size: 24),
+              onBackspace,
+            ),
+          ),
+        ]),
+      ],
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// App entrypoint
+// ---------------------------------------------------------------------------
+
+void main() => runApp(const TchipaWalletApp());
+
+class TchipaWalletApp extends StatelessWidget {
+  const TchipaWalletApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    final base = ThemeData.dark(useMaterial3: true);
+    return MaterialApp(
+      title: 'Tchipa Wallet',
+      debugShowCheckedModeBanner: false,
+      theme: base.copyWith(
+        scaffoldBackgroundColor: kBg,
+        colorScheme: base.colorScheme.copyWith(
+          primary: kAccent,
+          surface: kCard,
+        ),
+        appBarTheme: const AppBarTheme(
+          backgroundColor: kBg,
+          surfaceTintColor: Colors.transparent,
+          elevation: 0,
+          centerTitle: true,
+        ),
+        snackBarTheme: const SnackBarThemeData(
+          contentTextStyle: TextStyle(color: Colors.white),
+        ),
+      ),
+      home: const SplashScreen(),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// SplashScreen — decide route based on stored wallet + lock state.
+// ---------------------------------------------------------------------------
+
+class SplashScreen extends StatefulWidget {
+  const SplashScreen({super.key});
+  @override
+  State<SplashScreen> createState() => _SplashScreenState();
+}
+
+class _SplashScreenState extends State<SplashScreen> {
+  @override
+  void initState() {
+    super.initState();
+    _route();
+  }
+
+  Future<void> _route() async {
+    final svc = WalletService.instance;
+    final has = await svc.hasStoredWallet();
+    if (has) await svc.loadFromStorage();
+    final hasPin = has && await svc.hasPin();
+    if (!mounted) return;
+    Widget next;
+    if (!has) {
+      next = const OnboardScreen();
+    } else if (hasPin) {
+      next = const LockScreen();
+    } else {
+      next = const HomeScreen();
+    }
+    Navigator.of(context)
+        .pushReplacement(MaterialPageRoute(builder: (_) => next));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return const Scaffold(
+      backgroundColor: kBg,
+      body: Center(child: SpinningLogo(size: 96)),
+    );
+  }
+}
+
 // ---------------------------------------------------------------------------
 // OnboardScreen — Create or Import.
 // ---------------------------------------------------------------------------
@@ -338,61 +657,82 @@ class OnboardScreen extends StatelessWidget {
     return Scaffold(
       body: SafeArea(
         child: Padding(
-          padding: const EdgeInsets.all(24),
+          padding: const EdgeInsets.fromLTRB(24, 24, 24, 28),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              const SizedBox(height: 48),
-              const Center(child: SpinningLogo(size: 128)),
-              const SizedBox(height: 24),
+              const SizedBox(height: 36),
+              const Center(child: SpinningLogo(size: 132)),
+              const SizedBox(height: 32),
               const Text(
                 'Tchipa Wallet',
                 textAlign: TextAlign.center,
                 style: TextStyle(
                   color: Colors.white,
-                  fontSize: 28,
-                  fontWeight: FontWeight.w700,
+                  fontSize: 30,
+                  fontWeight: FontWeight.w800,
+                  letterSpacing: 0.3,
                 ),
               ),
-              const SizedBox(height: 8),
+              const SizedBox(height: 10),
               const Text(
-                'Votre wallet USDT/Polygon en self-custody.\nVous gardez vos clés, vous gardez vos fonds.',
+                'Votre wallet USDT sur Polygon, en self-custody.\nVos clés, vos fonds — personne d\'autre.',
                 textAlign: TextAlign.center,
-                style: TextStyle(color: kMuted, fontSize: 14, height: 1.4),
+                style: TextStyle(color: kMuted, fontSize: 14.5, height: 1.5),
               ),
+              const SizedBox(height: 28),
+              _bullet(Icons.lock_outline, 'Clés stockées chiffrées sur l\'appareil'),
+              _bullet(Icons.bolt_outlined, 'Envoi & réception USDT en quelques secondes'),
+              _bullet(Icons.fingerprint, 'Déverrouillage par empreinte ou code'),
               const Spacer(),
-              ElevatedButton(
+              PrimaryButton(
+                label: 'Créer une nouvelle wallet',
+                icon: Icons.add,
                 onPressed: () => Navigator.of(context).push(
                   MaterialPageRoute(builder: (_) => const CreateWalletScreen()),
                 ),
-                child: const Text('Créer une nouvelle wallet'),
               ),
               const SizedBox(height: 12),
-              OutlinedButton(
+              GhostButton(
+                label: 'Importer une phrase',
+                icon: Icons.download_outlined,
                 onPressed: () => Navigator.of(context).push(
                   MaterialPageRoute(builder: (_) => const ImportWalletScreen()),
                 ),
-                style: OutlinedButton.styleFrom(
-                  foregroundColor: Colors.white,
-                  minimumSize: const Size.fromHeight(52),
-                  side: const BorderSide(color: kMuted),
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(14),
-                  ),
-                ),
-                child: const Text("J'ai déjà une phrase de récupération"),
               ),
-              const SizedBox(height: 24),
             ],
           ),
         ),
       ),
     );
   }
+
+  Widget _bullet(IconData icon, String text) => Padding(
+        padding: const EdgeInsets.symmetric(vertical: 7),
+        child: Row(
+          children: [
+            Container(
+              width: 38,
+              height: 38,
+              decoration: BoxDecoration(
+                color: kCard,
+                borderRadius: BorderRadius.circular(11),
+                border: Border.all(color: kStroke),
+              ),
+              child: Icon(icon, color: kAccent, size: 19),
+            ),
+            const SizedBox(width: 14),
+            Expanded(
+              child: Text(text,
+                  style: const TextStyle(color: Colors.white, fontSize: 14)),
+            ),
+          ],
+        ),
+      );
 }
 
 // ---------------------------------------------------------------------------
-// CreateWalletScreen — show 12 words, force confirmation.
+// CreateWalletScreen — show 12 words, force confirmation, then set a PIN.
 // ---------------------------------------------------------------------------
 
 class CreateWalletScreen extends StatefulWidget {
@@ -417,16 +757,13 @@ class _CreateWalletScreenState extends State<CreateWalletScreen> {
     try {
       await WalletService.instance.importMnemonic(_mnemonic);
       if (!mounted) return;
-      Navigator.of(context).pushAndRemoveUntil(
-        MaterialPageRoute(builder: (_) => const HomeScreen()),
-        (_) => false,
+      Navigator.of(context).pushReplacement(
+        MaterialPageRoute(builder: (_) => const SetPinScreen()),
       );
     } catch (e) {
       setState(() => _saving = false);
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Erreur: $e')),
-      );
+      showToast(context, 'Erreur: $e');
     }
   }
 
@@ -437,109 +774,114 @@ class _CreateWalletScreenState extends State<CreateWalletScreen> {
       appBar: AppBar(title: const Text('Phrase de récupération')),
       body: SafeArea(
         child: Padding(
-          padding: const EdgeInsets.all(24),
+          padding: const EdgeInsets.fromLTRB(24, 8, 24, 24),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              const Text(
-                'Notez ces 12 mots dans l\'ordre et gardez-les en lieu sûr. '
-                'Quiconque a accès à cette phrase contrôle votre wallet. '
-                'Tchipa ne peut PAS la récupérer.',
-                style: TextStyle(color: kMuted, height: 1.4),
+              Container(
+                padding: const EdgeInsets.all(14),
+                decoration: BoxDecoration(
+                  color: kGold.withValues(alpha: 0.10),
+                  borderRadius: BorderRadius.circular(14),
+                  border: Border.all(color: kGold.withValues(alpha: 0.3)),
+                ),
+                child: const Row(
+                  children: [
+                    Icon(Icons.warning_amber_rounded, color: kGold, size: 22),
+                    SizedBox(width: 12),
+                    Expanded(
+                      child: Text(
+                        'Notez ces 12 mots dans l\'ordre, hors-ligne. '
+                        'Qui les détient contrôle vos fonds. Tchipa ne peut PAS les récupérer.',
+                        style: TextStyle(color: Colors.white, fontSize: 12.5, height: 1.4),
+                      ),
+                    ),
+                  ],
+                ),
               ),
-              const SizedBox(height: 20),
-              Stack(
-                children: [
-                  Container(
-                    padding: const EdgeInsets.all(16),
-                    decoration: BoxDecoration(
-                      color: kCard,
-                      borderRadius: BorderRadius.circular(14),
-                    ),
-                    child: GridView.builder(
-                      shrinkWrap: true,
-                      physics: const NeverScrollableScrollPhysics(),
-                      gridDelegate:
-                          const SliverGridDelegateWithFixedCrossAxisCount(
-                        crossAxisCount: 3,
-                        childAspectRatio: 2.4,
-                        crossAxisSpacing: 8,
-                        mainAxisSpacing: 8,
-                      ),
-                      itemCount: 12,
-                      itemBuilder: (_, i) => Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 10),
-                        alignment: Alignment.centerLeft,
-                        decoration: BoxDecoration(
-                          color: kBg,
-                          borderRadius: BorderRadius.circular(8),
+              const SizedBox(height: 18),
+              Expanded(
+                child: SingleChildScrollView(
+                  child: Stack(
+                    children: [
+                      GridView.builder(
+                        shrinkWrap: true,
+                        physics: const NeverScrollableScrollPhysics(),
+                        gridDelegate:
+                            const SliverGridDelegateWithFixedCrossAxisCount(
+                          crossAxisCount: 2,
+                          childAspectRatio: 3.2,
+                          crossAxisSpacing: 12,
+                          mainAxisSpacing: 12,
                         ),
-                        child: Text(
-                          '${i + 1}. ${words[i]}',
-                          style: const TextStyle(
-                            color: Colors.white,
-                            fontWeight: FontWeight.w600,
-                          ),
-                        ),
-                      ),
-                    ),
-                  ),
-                  if (!_revealed)
-                    Positioned.fill(
-                      child: GestureDetector(
-                        onTap: () => setState(() => _revealed = true),
-                        child: Container(
-                          decoration: BoxDecoration(
-                            color: kCard,
-                            borderRadius: BorderRadius.circular(14),
-                          ),
-                          alignment: Alignment.center,
-                          child: const Column(
-                            mainAxisSize: MainAxisSize.min,
+                        itemCount: 12,
+                        itemBuilder: (_, i) => Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 14),
+                          alignment: Alignment.centerLeft,
+                          decoration: cardDecoration(),
+                          child: Row(
                             children: [
-                              Icon(Icons.visibility, color: kAccent, size: 32),
-                              SizedBox(height: 8),
-                              Text(
-                                'Toucher pour révéler',
-                                style: TextStyle(color: Colors.white),
-                              ),
+                              Text('${i + 1}',
+                                  style: const TextStyle(
+                                      color: kMuted,
+                                      fontSize: 12,
+                                      fontWeight: FontWeight.w600)),
+                              const SizedBox(width: 10),
+                              Text(words[i],
+                                  style: const TextStyle(
+                                      color: Colors.white,
+                                      fontSize: 15,
+                                      fontWeight: FontWeight.w600)),
                             ],
                           ),
                         ),
                       ),
-                    ),
-                ],
+                      if (!_revealed)
+                        Positioned.fill(
+                          child: ClipRRect(
+                            borderRadius: BorderRadius.circular(18),
+                            child: GestureDetector(
+                              onTap: () => setState(() => _revealed = true),
+                              child: Container(
+                                color: kBg.withValues(alpha: 0.86),
+                                alignment: Alignment.center,
+                                child: const Column(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    Icon(Icons.visibility_off_outlined,
+                                        color: kAccent, size: 34),
+                                    SizedBox(height: 10),
+                                    Text('Toucher pour révéler',
+                                        style: TextStyle(
+                                            color: Colors.white,
+                                            fontWeight: FontWeight.w600)),
+                                  ],
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                    ],
+                  ),
+                ),
               ),
-              const SizedBox(height: 16),
+              const SizedBox(height: 12),
               if (_revealed)
-                OutlinedButton.icon(
+                TextButton.icon(
                   onPressed: () async {
                     await Clipboard.setData(ClipboardData(text: _mnemonic));
                     if (!context.mounted) return;
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      const SnackBar(content: Text('Phrase copiée.')),
-                    );
+                    showToast(context, 'Phrase copiée.');
                   },
-                  icon: const Icon(Icons.copy, size: 18),
-                  label: const Text('Copier'),
-                  style: OutlinedButton.styleFrom(
-                    foregroundColor: Colors.white,
-                    side: const BorderSide(color: kMuted),
-                  ),
+                  icon: const Icon(Icons.copy, size: 16, color: kMuted),
+                  label: const Text('Copier la phrase',
+                      style: TextStyle(color: kMuted)),
                 ),
-              const Spacer(),
-              ElevatedButton(
-                onPressed: _revealed && !_saving ? _confirm : null,
-                child: _saving
-                    ? const SizedBox(
-                        height: 22,
-                        width: 22,
-                        child: CircularProgressIndicator(
-                          color: Colors.white,
-                          strokeWidth: 2.4,
-                        ),
-                      )
-                    : const Text("J'ai noté la phrase, continuer"),
+              const SizedBox(height: 8),
+              PrimaryButton(
+                label: 'J\'ai noté la phrase, continuer',
+                busy: _saving,
+                onPressed: _revealed ? _confirm : null,
               ),
             ],
           ),
@@ -550,7 +892,7 @@ class _CreateWalletScreenState extends State<CreateWalletScreen> {
 }
 
 // ---------------------------------------------------------------------------
-// ImportWalletScreen — paste an existing mnemonic.
+// ImportWalletScreen — paste an existing mnemonic, then set a PIN.
 // ---------------------------------------------------------------------------
 
 class ImportWalletScreen extends StatefulWidget {
@@ -578,14 +920,13 @@ class _ImportWalletScreenState extends State<ImportWalletScreen> {
     try {
       await WalletService.instance.importMnemonic(_ctrl.text);
       if (!mounted) return;
-      Navigator.of(context).pushAndRemoveUntil(
-        MaterialPageRoute(builder: (_) => const HomeScreen()),
-        (_) => false,
+      Navigator.of(context).pushReplacement(
+        MaterialPageRoute(builder: (_) => const SetPinScreen()),
       );
     } catch (e) {
       setState(() {
         _busy = false;
-        _err = e.toString();
+        _err = e.toString().replaceFirst('FormatException: ', '');
       });
     }
   }
@@ -596,44 +937,35 @@ class _ImportWalletScreenState extends State<ImportWalletScreen> {
       appBar: AppBar(title: const Text('Importer une wallet')),
       body: SafeArea(
         child: Padding(
-          padding: const EdgeInsets.all(24),
+          padding: const EdgeInsets.fromLTRB(24, 8, 24, 24),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
               const Text(
                 'Collez votre phrase de 12 ou 24 mots, séparés par des espaces.',
-                style: TextStyle(color: kMuted, height: 1.4),
+                style: TextStyle(color: kMuted, height: 1.5, fontSize: 14),
               ),
-              const SizedBox(height: 16),
-              TextField(
-                controller: _ctrl,
-                maxLines: 4,
-                style: const TextStyle(color: Colors.white),
-                decoration: InputDecoration(
-                  filled: true,
-                  fillColor: kCard,
-                  hintText: 'word1 word2 word3 ...',
-                  hintStyle: const TextStyle(color: kMuted),
-                  border: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(14),
-                    borderSide: BorderSide.none,
+              const SizedBox(height: 18),
+              Container(
+                decoration: cardDecoration(),
+                child: TextField(
+                  controller: _ctrl,
+                  maxLines: 4,
+                  style: const TextStyle(color: Colors.white, fontSize: 15),
+                  decoration: InputDecoration(
+                    contentPadding: const EdgeInsets.all(16),
+                    hintText: 'word1 word2 word3 …',
+                    hintStyle: const TextStyle(color: kMuted),
+                    border: InputBorder.none,
+                    errorText: _err,
                   ),
-                  errorText: _err,
                 ),
               ),
               const Spacer(),
-              ElevatedButton(
-                onPressed: _busy ? null : _submit,
-                child: _busy
-                    ? const SizedBox(
-                        height: 22,
-                        width: 22,
-                        child: CircularProgressIndicator(
-                          color: Colors.white,
-                          strokeWidth: 2.4,
-                        ),
-                      )
-                    : const Text('Importer'),
+              PrimaryButton(
+                label: 'Importer',
+                busy: _busy,
+                onPressed: _submit,
               ),
             ],
           ),
@@ -644,7 +976,272 @@ class _ImportWalletScreenState extends State<ImportWalletScreen> {
 }
 
 // ---------------------------------------------------------------------------
-// HomeScreen — balances + actions.
+// SetPinScreen — choose a 6-digit PIN (enter + confirm), then offer biometrics.
+// ---------------------------------------------------------------------------
+
+class SetPinScreen extends StatefulWidget {
+  const SetPinScreen({super.key, this.asChange = false});
+
+  /// When true, this is a "change PIN" flow reached from Profile — it pops back
+  /// instead of routing to Home.
+  final bool asChange;
+
+  @override
+  State<SetPinScreen> createState() => _SetPinScreenState();
+}
+
+class _SetPinScreenState extends State<SetPinScreen> {
+  String _first = '';
+  String _entry = '';
+  bool _confirming = false;
+  String? _err;
+
+  void _onDigit(String d) {
+    if (_entry.length >= 6) return;
+    setState(() {
+      _entry += d;
+      _err = null;
+    });
+    if (_entry.length == 6) _advance();
+  }
+
+  void _onBackspace() {
+    if (_entry.isEmpty) return;
+    setState(() => _entry = _entry.substring(0, _entry.length - 1));
+  }
+
+  Future<void> _advance() async {
+    if (!_confirming) {
+      setState(() {
+        _first = _entry;
+        _entry = '';
+        _confirming = true;
+      });
+      return;
+    }
+    if (_entry != _first) {
+      setState(() {
+        _err = 'Les codes ne correspondent pas.';
+        _entry = '';
+        _first = '';
+        _confirming = false;
+      });
+      return;
+    }
+    await WalletService.instance.setPin(_entry);
+    if (!mounted) return;
+    await _offerBiometric();
+  }
+
+  Future<void> _offerBiometric() async {
+    final canBio = await BioAuth.available();
+    if (canBio && mounted) {
+      final enable = await showDialog<bool>(
+        context: context,
+        builder: (_) => AlertDialog(
+          backgroundColor: kCard,
+          shape:
+              RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
+          title: const Text('Déverrouillage biométrique',
+              style: TextStyle(color: Colors.white)),
+          content: const Text(
+            'Activer le déverrouillage par empreinte / visage ?',
+            style: TextStyle(color: kMuted),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('Plus tard', style: TextStyle(color: kMuted)),
+            ),
+            TextButton(
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('Activer',
+                  style: TextStyle(
+                      color: kAccent, fontWeight: FontWeight.w600)),
+            ),
+          ],
+        ),
+      );
+      if (enable == true) {
+        final ok = await BioAuth.authenticate('Confirmer la biométrie');
+        await WalletService.instance.setBioEnabled(ok);
+      }
+    }
+    if (!mounted) return;
+    if (widget.asChange) {
+      Navigator.pop(context);
+      showToast(context, 'Code mis à jour.');
+    } else {
+      Navigator.of(context).pushAndRemoveUntil(
+        MaterialPageRoute(builder: (_) => const HomeScreen()),
+        (_) => false,
+      );
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: widget.asChange ? AppBar(title: const Text('Changer le code')) : null,
+      body: SafeArea(
+        child: Column(
+          children: [
+            const Spacer(flex: 2),
+            Icon(_confirming ? Icons.lock_outline : Icons.pin_outlined,
+                color: kAccent, size: 36),
+            const SizedBox(height: 18),
+            Text(
+              _confirming ? 'Confirmez votre code' : 'Créez un code à 6 chiffres',
+              style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 19,
+                  fontWeight: FontWeight.w700),
+            ),
+            const SizedBox(height: 10),
+            Text(
+              _err ?? 'Il protège l\'accès à votre wallet.',
+              style: TextStyle(
+                  color: _err != null ? kRed : kMuted, fontSize: 13),
+            ),
+            const SizedBox(height: 28),
+            PinDots(length: 6, filled: _entry.length),
+            const Spacer(flex: 3),
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 36),
+              child: PinKeypad(onDigit: _onDigit, onBackspace: _onBackspace),
+            ),
+            const SizedBox(height: 12),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// LockScreen — unlock with biometrics or PIN. Reused for re-auth (verifyOnly).
+// ---------------------------------------------------------------------------
+
+class LockScreen extends StatefulWidget {
+  const LockScreen({super.key, this.verifyOnly = false});
+
+  /// When true, returns `true` via Navigator.pop on success instead of routing
+  /// to Home — used to gate sensitive actions (revealing the recovery phrase).
+  final bool verifyOnly;
+
+  @override
+  State<LockScreen> createState() => _LockScreenState();
+}
+
+class _LockScreenState extends State<LockScreen> {
+  String _entry = '';
+  String? _err;
+  bool _bioAvailable = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _initBio();
+  }
+
+  Future<void> _initBio() async {
+    final enabled = await WalletService.instance.bioEnabled();
+    final avail = enabled && await BioAuth.available();
+    if (!mounted) return;
+    setState(() => _bioAvailable = avail);
+    if (avail) {
+      WidgetsBinding.instance.addPostFrameCallback((_) => _tryBio());
+    }
+  }
+
+  Future<void> _tryBio() async {
+    final ok = await BioAuth.authenticate('Déverrouiller Tchipa Wallet');
+    if (ok) _success();
+  }
+
+  void _onDigit(String d) {
+    if (_entry.length >= 6) return;
+    setState(() {
+      _entry += d;
+      _err = null;
+    });
+    if (_entry.length == 6) _check();
+  }
+
+  void _onBackspace() {
+    if (_entry.isEmpty) return;
+    setState(() => _entry = _entry.substring(0, _entry.length - 1));
+  }
+
+  Future<void> _check() async {
+    final ok = await WalletService.instance.verifyPin(_entry);
+    if (ok) {
+      _success();
+    } else {
+      setState(() {
+        _err = 'Code incorrect.';
+        _entry = '';
+      });
+    }
+  }
+
+  void _success() {
+    if (!mounted) return;
+    if (widget.verifyOnly) {
+      Navigator.pop(context, true);
+    } else {
+      Navigator.of(context).pushReplacement(
+        MaterialPageRoute(builder: (_) => const HomeScreen()),
+      );
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: widget.verifyOnly
+          ? AppBar(title: const Text('Confirmer l\'identité'))
+          : null,
+      body: SafeArea(
+        child: Column(
+          children: [
+            const Spacer(flex: 2),
+            const SpinningLogo(size: 84),
+            const SizedBox(height: 24),
+            Text(
+              widget.verifyOnly ? 'Entrez votre code' : 'Bon retour',
+              style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 20,
+                  fontWeight: FontWeight.w700),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              _err ?? 'Déverrouillez votre wallet',
+              style: TextStyle(
+                  color: _err != null ? kRed : kMuted, fontSize: 13),
+            ),
+            const SizedBox(height: 28),
+            PinDots(length: 6, filled: _entry.length),
+            const Spacer(flex: 3),
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 36),
+              child: PinKeypad(
+                onDigit: _onDigit,
+                onBackspace: _onBackspace,
+                onBio: _bioAvailable ? _tryBio : null,
+              ),
+            ),
+            const SizedBox(height: 12),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// HomeScreen — balance hero + assets + actions.
 // ---------------------------------------------------------------------------
 
 class HomeScreen extends StatefulWidget {
@@ -685,200 +1282,254 @@ class _HomeScreenState extends State<HomeScreen> {
       if (!mounted) return;
       setState(() {
         _loading = false;
-        _err = e.toString();
+        _err = 'Réseau indisponible. Tirez pour réessayer.';
       });
     }
   }
 
-  Future<void> _confirmWipe() async {
-    final ok = await showDialog<bool>(
-      context: context,
-      builder: (_) => AlertDialog(
-        backgroundColor: kCard,
-        title: const Text('Supprimer cette wallet ?',
-            style: TextStyle(color: Colors.white)),
-        content: const Text(
-          "Sans la phrase de récupération, les fonds seront perdus. Confirmez-vous ?",
-          style: TextStyle(color: kMuted),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context, false),
-            child: const Text('Annuler'),
-          ),
-          TextButton(
-            onPressed: () => Navigator.pop(context, true),
-            child: const Text('Supprimer',
-                style: TextStyle(color: Colors.redAccent)),
-          ),
-        ],
-      ),
-    );
-    if (ok != true) return;
-    await WalletService.instance.wipe();
-    if (!mounted) return;
-    Navigator.of(context).pushAndRemoveUntil(
-      MaterialPageRoute(builder: (_) => const OnboardScreen()),
-      (_) => false,
-    );
-  }
-
   @override
   Widget build(BuildContext context) {
-    final addr = WalletService.instance.address?.hexEip55 ?? '';
-    final usdtStr = WalletService.formatAmount(_usdt, kUsdtDecimals);
+    final addr = WalletService.instance.addressHex;
+    final usdtStr = WalletService.formatAmount(_usdt, kUsdtDecimals, displayDp: 2);
     final polStr = WalletService.formatAmount(_pol, 18, displayDp: 4);
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Tchipa Wallet'),
+        titleSpacing: 20,
+        title: Row(
+          children: [
+            const Text('Tchipa',
+                style: TextStyle(fontWeight: FontWeight.w800, fontSize: 20)),
+            Text(' Wallet',
+                style: TextStyle(
+                    fontWeight: FontWeight.w300,
+                    fontSize: 20,
+                    color: kMuted.withValues(alpha: 0.9))),
+          ],
+        ),
+        centerTitle: false,
         actions: [
-          IconButton(
-            icon: const Icon(Icons.delete_outline),
-            onPressed: _confirmWipe,
-            tooltip: 'Supprimer la wallet',
+          Padding(
+            padding: const EdgeInsets.only(right: 14),
+            child: GestureDetector(
+              onTap: () async {
+                await Navigator.of(context).push(MaterialPageRoute(
+                    builder: (_) => const ProfileScreen()));
+                if (mounted) _refresh();
+              },
+              child: Container(
+                width: 40,
+                height: 40,
+                decoration: BoxDecoration(
+                  color: kCard,
+                  shape: BoxShape.circle,
+                  border: Border.all(color: kStroke),
+                ),
+                child: const Icon(Icons.person_outline,
+                    color: Colors.white, size: 22),
+              ),
+            ),
           ),
         ],
       ),
       body: RefreshIndicator(
         color: kAccent,
+        backgroundColor: kCard,
         onRefresh: _refresh,
         child: ListView(
-          padding: const EdgeInsets.all(20),
+          padding: const EdgeInsets.fromLTRB(20, 8, 20, 28),
           children: [
-            _addressCard(addr),
-            const SizedBox(height: 16),
-            _balanceCard(
-              symbol: 'USDT',
-              amount: usdtStr,
-              sub: 'Tether (Polygon)',
-              loading: _loading,
-            ),
-            const SizedBox(height: 12),
-            _balanceCard(
-              symbol: 'POL',
-              amount: polStr,
-              sub: 'Gas Polygon',
-              loading: _loading,
-            ),
+            _heroCard(usdtStr, addr),
             if (_err != null) ...[
-              const SizedBox(height: 16),
-              Text('Erreur: $_err',
-                  style: const TextStyle(color: Colors.redAccent)),
+              const SizedBox(height: 14),
+              Row(
+                children: [
+                  const Icon(Icons.cloud_off, color: kMuted, size: 16),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(_err!,
+                        style: const TextStyle(color: kMuted, fontSize: 12.5)),
+                  ),
+                ],
+              ),
             ],
-            const SizedBox(height: 24),
-            Row(
-              children: [
-                Expanded(
-                  child: ElevatedButton.icon(
-                    icon: const Icon(Icons.arrow_upward),
-                    label: const Text('Envoyer'),
-                    onPressed: () async {
-                      await Navigator.of(context).push(
-                        MaterialPageRoute(builder: (_) => const SendScreen()),
-                      );
-                      _refresh();
-                    },
-                  ),
-                ),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: OutlinedButton.icon(
-                    icon: const Icon(Icons.arrow_downward),
-                    label: const Text('Recevoir'),
-                    onPressed: () => Navigator.of(context).push(
-                      MaterialPageRoute(builder: (_) => const ReceiveScreen()),
-                    ),
-                    style: OutlinedButton.styleFrom(
-                      foregroundColor: Colors.white,
-                      minimumSize: const Size.fromHeight(52),
-                      side: const BorderSide(color: kMuted),
-                      shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(14),
-                      ),
-                    ),
-                  ),
-                ),
-              ],
-            ),
+            const SizedBox(height: 20),
+            _actions(),
+            const SizedBox(height: 26),
+            const Text('Actifs',
+                style: TextStyle(
+                    color: kMuted,
+                    fontSize: 13,
+                    fontWeight: FontWeight.w600,
+                    letterSpacing: 0.5)),
+            const SizedBox(height: 12),
+            _assetTile(
+                symbol: 'USDT',
+                name: 'Tether USD',
+                amount: usdtStr,
+                color: kGreen),
+            const SizedBox(height: 10),
+            _assetTile(
+                symbol: 'POL',
+                name: 'Polygon · Gas',
+                amount: polStr,
+                color: kAccent),
           ],
         ),
       ),
     );
   }
 
-  Widget _addressCard(String addr) {
-    final short = addr.length > 12
-        ? '${addr.substring(0, 8)}…${addr.substring(addr.length - 6)}'
-        : addr;
-    return GestureDetector(
-      onTap: () async {
-        await Clipboard.setData(ClipboardData(text: addr));
-        if (!mounted) return;
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Adresse copiée.')),
-        );
-      },
-      child: Container(
-        padding: const EdgeInsets.all(16),
-        decoration: BoxDecoration(
-          color: kCard,
-          borderRadius: BorderRadius.circular(14),
+  Widget _heroCard(String usdtStr, String addr) {
+    return Container(
+      padding: const EdgeInsets.all(22),
+      decoration: BoxDecoration(
+        gradient: const LinearGradient(
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+          colors: [Color(0xFF2A2150), Color(0xFF161A23)],
         ),
-        child: Row(
-          children: [
-            const Icon(Icons.account_balance_wallet, color: kAccent),
-            const SizedBox(width: 12),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
+        borderRadius: BorderRadius.circular(22),
+        border: Border.all(color: kAccent.withValues(alpha: 0.25)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text('Solde total',
+              style: TextStyle(color: kMuted, fontSize: 13)),
+          const SizedBox(height: 10),
+          _loading
+              ? const Padding(
+                  padding: EdgeInsets.symmetric(vertical: 6),
+                  child: SizedBox(
+                    height: 30,
+                    width: 30,
+                    child: CircularProgressIndicator(
+                        color: kAccent, strokeWidth: 2.4),
+                  ),
+                )
+              : Row(
+                  crossAxisAlignment: CrossAxisAlignment.baseline,
+                  textBaseline: TextBaseline.alphabetic,
+                  children: [
+                    Text(usdtStr,
+                        style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 40,
+                            fontWeight: FontWeight.w800,
+                            letterSpacing: -0.5)),
+                    const SizedBox(width: 8),
+                    const Padding(
+                      padding: EdgeInsets.only(bottom: 6),
+                      child: Text('USDT',
+                          style: TextStyle(
+                              color: kMuted,
+                              fontSize: 16,
+                              fontWeight: FontWeight.w600)),
+                    ),
+                  ],
+                ),
+          const SizedBox(height: 16),
+          GestureDetector(
+            onTap: () async {
+              await Clipboard.setData(ClipboardData(text: addr));
+              if (!mounted) return;
+              showToast(context, 'Adresse copiée.');
+            },
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+              decoration: BoxDecoration(
+                color: Colors.black.withValues(alpha: 0.25),
+                borderRadius: BorderRadius.circular(30),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
                 children: [
-                  const Text('Adresse',
-                      style: TextStyle(color: kMuted, fontSize: 12)),
-                  const SizedBox(height: 2),
-                  Text(short,
+                  const Icon(Icons.account_balance_wallet_outlined,
+                      color: kAccent, size: 16),
+                  const SizedBox(width: 8),
+                  Text(WalletService.shortAddress(addr),
                       style: const TextStyle(
                           color: Colors.white,
                           fontFamily: 'monospace',
-                          fontSize: 14)),
+                          fontSize: 13)),
+                  const SizedBox(width: 8),
+                  const Icon(Icons.copy, color: kMuted, size: 14),
                 ],
               ),
             ),
-            const Icon(Icons.copy, color: kMuted, size: 18),
-          ],
-        ),
+          ),
+        ],
       ),
     );
   }
 
-  Widget _balanceCard({
+  Widget _actions() {
+    Widget item(IconData icon, String label, VoidCallback onTap) => Expanded(
+          child: GestureDetector(
+            onTap: onTap,
+            child: Container(
+              padding: const EdgeInsets.symmetric(vertical: 16),
+              decoration: cardDecoration(),
+              child: Column(
+                children: [
+                  Container(
+                    width: 44,
+                    height: 44,
+                    decoration: const BoxDecoration(
+                        gradient: kAccentGrad, shape: BoxShape.circle),
+                    child: Icon(icon, color: Colors.white, size: 22),
+                  ),
+                  const SizedBox(height: 10),
+                  Text(label,
+                      style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 14,
+                          fontWeight: FontWeight.w600)),
+                ],
+              ),
+            ),
+          ),
+        );
+    return Row(
+      children: [
+        item(Icons.arrow_upward, 'Envoyer', () async {
+          await Navigator.of(context).push(
+              MaterialPageRoute(builder: (_) => const SendScreen()));
+          _refresh();
+        }),
+        const SizedBox(width: 12),
+        item(Icons.arrow_downward, 'Recevoir', () {
+          Navigator.of(context).push(
+              MaterialPageRoute(builder: (_) => const ReceiveScreen()));
+        }),
+      ],
+    );
+  }
+
+  Widget _assetTile({
     required String symbol,
+    required String name,
     required String amount,
-    required String sub,
-    required bool loading,
+    required Color color,
   }) {
     return Container(
       padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        color: kCard,
-        borderRadius: BorderRadius.circular(14),
-      ),
+      decoration: cardDecoration(),
       child: Row(
         children: [
           Container(
             width: 44,
             height: 44,
             decoration: BoxDecoration(
-              color: kBg,
-              borderRadius: BorderRadius.circular(22),
+              color: color.withValues(alpha: 0.15),
+              borderRadius: BorderRadius.circular(13),
             ),
             alignment: Alignment.center,
-            child: Text(
-              symbol.substring(0, 1),
-              style: const TextStyle(
-                  color: kAccent, fontWeight: FontWeight.w700, fontSize: 18),
-            ),
+            child: Text(symbol.substring(0, 1),
+                style: TextStyle(
+                    color: color, fontWeight: FontWeight.w800, fontSize: 18)),
           ),
-          const SizedBox(width: 12),
+          const SizedBox(width: 14),
           Expanded(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
@@ -886,24 +1537,25 @@ class _HomeScreenState extends State<HomeScreen> {
                 Text(symbol,
                     style: const TextStyle(
                         color: Colors.white,
-                        fontWeight: FontWeight.w600,
-                        fontSize: 16)),
-                Text(sub, style: const TextStyle(color: kMuted, fontSize: 12)),
+                        fontWeight: FontWeight.w700,
+                        fontSize: 15)),
+                Text(name,
+                    style: const TextStyle(color: kMuted, fontSize: 12)),
               ],
             ),
           ),
-          loading
+          _loading
               ? const SizedBox(
-                  height: 18,
-                  width: 18,
-                  child: CircularProgressIndicator(
-                      strokeWidth: 2, color: kAccent),
+                  height: 16,
+                  width: 16,
+                  child:
+                      CircularProgressIndicator(strokeWidth: 2, color: kAccent),
                 )
               : Text(amount,
                   style: const TextStyle(
                       color: Colors.white,
                       fontWeight: FontWeight.w700,
-                      fontSize: 18)),
+                      fontSize: 16)),
         ],
       ),
     );
@@ -918,53 +1570,72 @@ class ReceiveScreen extends StatelessWidget {
   const ReceiveScreen({super.key});
   @override
   Widget build(BuildContext context) {
-    final addr = WalletService.instance.address?.hexEip55 ?? '';
+    final addr = WalletService.instance.addressHex;
     return Scaffold(
       appBar: AppBar(title: const Text('Recevoir')),
       body: SafeArea(
-        child: Padding(
+        child: SingleChildScrollView(
           padding: const EdgeInsets.all(24),
           child: Column(
             children: [
-              const Text(
-                "N'envoyez QUE de l'USDT ou du POL sur le réseau Polygon "
-                "à cette adresse. Tout autre token ou réseau peut être perdu.",
-                textAlign: TextAlign.center,
-                style: TextStyle(color: kMuted, height: 1.4),
+              Container(
+                padding: const EdgeInsets.all(14),
+                decoration: BoxDecoration(
+                  color: kGold.withValues(alpha: 0.10),
+                  borderRadius: BorderRadius.circular(14),
+                  border: Border.all(color: kGold.withValues(alpha: 0.3)),
+                ),
+                child: const Row(
+                  children: [
+                    Icon(Icons.info_outline, color: kGold, size: 20),
+                    SizedBox(width: 12),
+                    Expanded(
+                      child: Text(
+                        'Envoyez uniquement de l\'USDT ou du POL sur le réseau '
+                        'Polygon. Tout autre réseau / token sera perdu.',
+                        style: TextStyle(
+                            color: Colors.white, fontSize: 12.5, height: 1.4),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 28),
+              Container(
+                padding: const EdgeInsets.all(18),
+                decoration: BoxDecoration(
+                  color: Colors.white,
+                  borderRadius: BorderRadius.circular(20),
+                ),
+                child: QrImageView(
+                  data: addr,
+                  size: 230,
+                  backgroundColor: Colors.white,
+                ),
               ),
               const SizedBox(height: 24),
               Container(
                 padding: const EdgeInsets.all(16),
-                decoration: BoxDecoration(
-                  color: Colors.white,
-                  borderRadius: BorderRadius.circular(14),
-                ),
-                child: QrImageView(
-                  data: addr,
-                  size: 240,
-                  backgroundColor: Colors.white,
-                ),
-              ),
-              const SizedBox(height: 20),
-              SelectableText(
-                addr,
-                textAlign: TextAlign.center,
-                style: const TextStyle(
-                  color: Colors.white,
-                  fontFamily: 'monospace',
-                  fontSize: 13,
+                decoration: cardDecoration(),
+                child: SelectableText(
+                  addr,
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontFamily: 'monospace',
+                    fontSize: 13,
+                    height: 1.4,
+                  ),
                 ),
               ),
               const SizedBox(height: 20),
-              ElevatedButton.icon(
-                icon: const Icon(Icons.copy),
-                label: const Text("Copier l'adresse"),
+              PrimaryButton(
+                label: 'Copier l\'adresse',
+                icon: Icons.copy,
                 onPressed: () async {
                   await Clipboard.setData(ClipboardData(text: addr));
                   if (!context.mounted) return;
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(content: Text('Adresse copiée.')),
-                  );
+                  showToast(context, 'Adresse copiée.');
                 },
               ),
             ],
@@ -1008,7 +1679,7 @@ class _SendScreenState extends State<SendScreen> {
       EthereumAddress.fromHex(to); // validates
       final amount = WalletService.parseAmount(_amtCtrl.text, kUsdtDecimals);
       if (amount <= BigInt.zero) {
-        throw const FormatException('Montant doit être > 0.');
+        throw const FormatException('Le montant doit être supérieur à 0.');
       }
       final hash = await WalletService.instance.sendUsdt(
         toHex: to,
@@ -1016,16 +1687,11 @@ class _SendScreenState extends State<SendScreen> {
       );
       if (!mounted) return;
       Navigator.pop(context);
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text('Transaction envoyée: ${hash.substring(0, 12)}…'),
-          duration: const Duration(seconds: 6),
-        ),
-      );
+      showToast(context, 'Transaction envoyée : ${hash.substring(0, 14)}…');
     } catch (e) {
       setState(() {
         _sending = false;
-        _err = e.toString();
+        _err = e.toString().replaceFirst('FormatException: ', '');
       });
     }
   }
@@ -1036,45 +1702,61 @@ class _SendScreenState extends State<SendScreen> {
       appBar: AppBar(title: const Text('Envoyer USDT')),
       body: SafeArea(
         child: Padding(
-          padding: const EdgeInsets.all(24),
+          padding: const EdgeInsets.fromLTRB(24, 8, 24, 24),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
               _field(
                 controller: _toCtrl,
                 label: 'Adresse destinataire',
-                hint: '0x...',
+                hint: '0x…',
               ),
-              const SizedBox(height: 16),
+              const SizedBox(height: 18),
               _field(
                 controller: _amtCtrl,
                 label: 'Montant (USDT)',
                 hint: '0.00',
-                keyboard: const TextInputType.numberWithOptions(decimal: true),
+                keyboard:
+                    const TextInputType.numberWithOptions(decimal: true),
               ),
               if (_err != null) ...[
-                const SizedBox(height: 12),
-                Text(_err!, style: const TextStyle(color: Colors.redAccent)),
+                const SizedBox(height: 14),
+                Row(
+                  children: [
+                    const Icon(Icons.error_outline, color: kRed, size: 16),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(_err!,
+                          style: const TextStyle(color: kRed, fontSize: 13)),
+                    ),
+                  ],
+                ),
               ],
-              const SizedBox(height: 12),
-              const Text(
-                "Note: les frais de gas sont payés en POL. Si votre solde POL "
-                "est à 0, la transaction échouera.",
-                style: TextStyle(color: kMuted, fontSize: 12, height: 1.4),
+              const SizedBox(height: 18),
+              Container(
+                padding: const EdgeInsets.all(14),
+                decoration: cardDecoration(color: kCardHi),
+                child: const Row(
+                  children: [
+                    Icon(Icons.local_gas_station_outlined,
+                        color: kMuted, size: 18),
+                    SizedBox(width: 10),
+                    Expanded(
+                      child: Text(
+                        'Les frais de gas sont payés en POL. Sans POL, la transaction échouera.',
+                        style: TextStyle(
+                            color: kMuted, fontSize: 12.5, height: 1.4),
+                      ),
+                    ),
+                  ],
+                ),
               ),
               const Spacer(),
-              ElevatedButton(
-                onPressed: _sending ? null : _send,
-                child: _sending
-                    ? const SizedBox(
-                        height: 22,
-                        width: 22,
-                        child: CircularProgressIndicator(
-                          color: Colors.white,
-                          strokeWidth: 2.4,
-                        ),
-                      )
-                    : const Text('Envoyer'),
+              PrimaryButton(
+                label: 'Envoyer',
+                icon: Icons.arrow_upward,
+                busy: _sending,
+                onPressed: _send,
               ),
             ],
           ),
@@ -1092,24 +1774,417 @@ class _SendScreenState extends State<SendScreen> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Text(label, style: const TextStyle(color: kMuted, fontSize: 12)),
-        const SizedBox(height: 6),
-        TextField(
-          controller: controller,
-          keyboardType: keyboard,
-          style: const TextStyle(color: Colors.white),
-          decoration: InputDecoration(
-            filled: true,
-            fillColor: kCard,
-            hintText: hint,
-            hintStyle: const TextStyle(color: kMuted),
-            border: OutlineInputBorder(
-              borderRadius: BorderRadius.circular(14),
-              borderSide: BorderSide.none,
+        Text(label,
+            style: const TextStyle(
+                color: kMuted, fontSize: 13, fontWeight: FontWeight.w600)),
+        const SizedBox(height: 8),
+        Container(
+          decoration: cardDecoration(),
+          child: TextField(
+            controller: controller,
+            keyboardType: keyboard,
+            style: const TextStyle(color: Colors.white, fontSize: 15),
+            decoration: InputDecoration(
+              contentPadding:
+                  const EdgeInsets.symmetric(horizontal: 16, vertical: 16),
+              hintText: hint,
+              hintStyle: const TextStyle(color: kMuted),
+              border: InputBorder.none,
             ),
           ),
         ),
       ],
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// ProfileScreen — address, recovery phrase, security, delete.
+// ---------------------------------------------------------------------------
+
+class ProfileScreen extends StatefulWidget {
+  const ProfileScreen({super.key});
+  @override
+  State<ProfileScreen> createState() => _ProfileScreenState();
+}
+
+class _ProfileScreenState extends State<ProfileScreen> {
+  bool _bio = false;
+  bool _bioAvailable = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    final bio = await WalletService.instance.bioEnabled();
+    final avail = await BioAuth.available();
+    if (!mounted) return;
+    setState(() {
+      _bio = bio;
+      _bioAvailable = avail;
+    });
+  }
+
+  Future<bool> _reauth() async {
+    final ok = await Navigator.of(context).push<bool>(
+      MaterialPageRoute(builder: (_) => const LockScreen(verifyOnly: true)),
+    );
+    return ok == true;
+  }
+
+  Future<void> _revealPhrase() async {
+    final ok = await _reauth();
+    if (ok && mounted) {
+      Navigator.of(context).push(
+        MaterialPageRoute(builder: (_) => const RecoveryPhraseScreen()),
+      );
+    }
+  }
+
+  Future<void> _toggleBio(bool v) async {
+    if (v) {
+      final ok = await BioAuth.authenticate('Activer la biométrie');
+      if (!ok) return;
+    }
+    await WalletService.instance.setBioEnabled(v);
+    if (!mounted) return;
+    setState(() => _bio = v);
+  }
+
+  Future<void> _delete() async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (_) => AlertDialog(
+        backgroundColor: kCard,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
+        title: const Text('Supprimer cette wallet ?',
+            style: TextStyle(color: Colors.white)),
+        content: const Text(
+          'Sans votre phrase de récupération, les fonds seront définitivement perdus.',
+          style: TextStyle(color: kMuted, height: 1.4),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Annuler', style: TextStyle(color: kMuted)),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Supprimer', style: TextStyle(color: kRed)),
+          ),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    await WalletService.instance.wipe();
+    if (!mounted) return;
+    Navigator.of(context).pushAndRemoveUntil(
+      MaterialPageRoute(builder: (_) => const OnboardScreen()),
+      (_) => false,
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final addr = WalletService.instance.addressHex;
+    return Scaffold(
+      appBar: AppBar(title: const Text('Profil')),
+      body: SafeArea(
+        child: ListView(
+          padding: const EdgeInsets.all(20),
+          children: [
+            Center(
+              child: Column(
+                children: [
+                  Container(
+                    width: 72,
+                    height: 72,
+                    decoration: const BoxDecoration(
+                        gradient: kAccentGrad, shape: BoxShape.circle),
+                    child: const Icon(Icons.person,
+                        color: Colors.white, size: 36),
+                  ),
+                  const SizedBox(height: 12),
+                  GestureDetector(
+                    onTap: () async {
+                      await Clipboard.setData(ClipboardData(text: addr));
+                      if (!context.mounted) return;
+                      showToast(context, 'Adresse copiée.');
+                    },
+                    child: Text(WalletService.shortAddress(addr),
+                        style: const TextStyle(
+                            color: Colors.white,
+                            fontFamily: 'monospace',
+                            fontSize: 15,
+                            fontWeight: FontWeight.w600)),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 28),
+            _section('Wallet'),
+            _tile(
+              icon: Icons.qr_code,
+              title: 'Adresse de réception',
+              onTap: () => Navigator.of(context).push(
+                  MaterialPageRoute(builder: (_) => const ReceiveScreen())),
+            ),
+            _tile(
+              icon: Icons.vpn_key_outlined,
+              title: 'Phrase de récupération',
+              subtitle: 'Affichée après vérification',
+              onTap: _revealPhrase,
+            ),
+            const SizedBox(height: 20),
+            _section('Sécurité'),
+            _switchTile(
+              icon: Icons.fingerprint,
+              title: 'Déverrouillage biométrique',
+              value: _bio,
+              enabled: _bioAvailable,
+              onChanged: _toggleBio,
+            ),
+            _tile(
+              icon: Icons.password_outlined,
+              title: 'Changer le code',
+              onTap: () => Navigator.of(context).push(MaterialPageRoute(
+                  builder: (_) => const SetPinScreen(asChange: true))),
+            ),
+            const SizedBox(height: 20),
+            _section('Réseau'),
+            _tile(
+              icon: Icons.hub_outlined,
+              title: 'Polygon',
+              subtitle: 'USDT (PoS) · gas en POL',
+              trailing: Container(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                decoration: BoxDecoration(
+                  color: kGreen.withValues(alpha: 0.15),
+                  borderRadius: BorderRadius.circular(20),
+                ),
+                child: const Text('Connecté',
+                    style: TextStyle(
+                        color: kGreen,
+                        fontSize: 11,
+                        fontWeight: FontWeight.w600)),
+              ),
+            ),
+            const SizedBox(height: 28),
+            _tile(
+              icon: Icons.delete_outline,
+              title: 'Supprimer la wallet',
+              danger: true,
+              onTap: _delete,
+            ),
+            const SizedBox(height: 24),
+            const Center(
+              child: Text('Tchipa Wallet · self-custody',
+                  style: TextStyle(color: kMuted, fontSize: 12)),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _section(String t) => Padding(
+        padding: const EdgeInsets.only(left: 4, bottom: 10),
+        child: Text(t,
+            style: const TextStyle(
+                color: kMuted,
+                fontSize: 13,
+                fontWeight: FontWeight.w600,
+                letterSpacing: 0.5)),
+      );
+
+  Widget _tile({
+    required IconData icon,
+    required String title,
+    String? subtitle,
+    Widget? trailing,
+    VoidCallback? onTap,
+    bool danger = false,
+  }) {
+    final color = danger ? kRed : Colors.white;
+    return Container(
+      margin: const EdgeInsets.only(bottom: 10),
+      decoration: cardDecoration(),
+      child: Material(
+        color: Colors.transparent,
+        child: InkWell(
+          borderRadius: BorderRadius.circular(18),
+          onTap: onTap,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 15),
+            child: Row(
+              children: [
+                Icon(icon, color: danger ? kRed : kAccent, size: 22),
+                const SizedBox(width: 14),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(title,
+                          style: TextStyle(
+                              color: color,
+                              fontSize: 15,
+                              fontWeight: FontWeight.w600)),
+                      if (subtitle != null) ...[
+                        const SizedBox(height: 2),
+                        Text(subtitle,
+                            style:
+                                const TextStyle(color: kMuted, fontSize: 12)),
+                      ],
+                    ],
+                  ),
+                ),
+                trailing ??
+                    (onTap != null && !danger
+                        ? const Icon(Icons.chevron_right, color: kMuted)
+                        : const SizedBox.shrink()),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _switchTile({
+    required IconData icon,
+    required String title,
+    required bool value,
+    required bool enabled,
+    required ValueChanged<bool> onChanged,
+  }) {
+    return Container(
+      margin: const EdgeInsets.only(bottom: 10),
+      decoration: cardDecoration(),
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 7),
+      child: Row(
+        children: [
+          Icon(icon, color: kAccent, size: 22),
+          const SizedBox(width: 14),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(title,
+                    style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 15,
+                        fontWeight: FontWeight.w600)),
+                if (!enabled)
+                  const Text('Indisponible sur cet appareil',
+                      style: TextStyle(color: kMuted, fontSize: 11)),
+              ],
+            ),
+          ),
+          Switch(
+            value: value,
+            activeThumbColor: kAccent,
+            onChanged: enabled ? onChanged : null,
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// RecoveryPhraseScreen — shown only after re-auth.
+// ---------------------------------------------------------------------------
+
+class RecoveryPhraseScreen extends StatelessWidget {
+  const RecoveryPhraseScreen({super.key});
+  @override
+  Widget build(BuildContext context) {
+    final mnemonic = WalletService.instance.mnemonic ?? '';
+    final words = mnemonic.split(' ');
+    return Scaffold(
+      appBar: AppBar(title: const Text('Phrase de récupération')),
+      body: SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(24, 8, 24, 24),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Container(
+                padding: const EdgeInsets.all(14),
+                decoration: BoxDecoration(
+                  color: kRed.withValues(alpha: 0.10),
+                  borderRadius: BorderRadius.circular(14),
+                  border: Border.all(color: kRed.withValues(alpha: 0.3)),
+                ),
+                child: const Row(
+                  children: [
+                    Icon(Icons.visibility_off_outlined, color: kRed, size: 20),
+                    SizedBox(width: 12),
+                    Expanded(
+                      child: Text(
+                        'Ne la montrez à personne et ne la saisissez sur aucun site.',
+                        style: TextStyle(
+                            color: Colors.white, fontSize: 12.5, height: 1.4),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 18),
+              Expanded(
+                child: SingleChildScrollView(
+                  child: GridView.builder(
+                    shrinkWrap: true,
+                    physics: const NeverScrollableScrollPhysics(),
+                    gridDelegate:
+                        const SliverGridDelegateWithFixedCrossAxisCount(
+                      crossAxisCount: 2,
+                      childAspectRatio: 3.2,
+                      crossAxisSpacing: 12,
+                      mainAxisSpacing: 12,
+                    ),
+                    itemCount: words.length,
+                    itemBuilder: (_, i) => Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 14),
+                      alignment: Alignment.centerLeft,
+                      decoration: cardDecoration(),
+                      child: Row(
+                        children: [
+                          Text('${i + 1}',
+                              style: const TextStyle(
+                                  color: kMuted,
+                                  fontSize: 12,
+                                  fontWeight: FontWeight.w600)),
+                          const SizedBox(width: 10),
+                          Text(words[i],
+                              style: const TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 15,
+                                  fontWeight: FontWeight.w600)),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 12),
+              GhostButton(
+                label: 'Copier la phrase',
+                icon: Icons.copy,
+                onPressed: () async {
+                  await Clipboard.setData(ClipboardData(text: mnemonic));
+                  if (!context.mounted) return;
+                  showToast(context, 'Phrase copiée.');
+                },
+              ),
+            ],
+          ),
+        ),
+      ),
     );
   }
 }
