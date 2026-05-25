@@ -495,10 +495,13 @@ class _SpinningLogoState extends State<SpinningLogo>
     return Container(
       width: widget.size,
       height: widget.size,
-      decoration: const BoxDecoration(
+      decoration: BoxDecoration(
         shape: BoxShape.circle,
         boxShadow: [
-          BoxShadow(color: Color(0x447C5CFF), blurRadius: 44, spreadRadius: 6),
+          BoxShadow(
+              color: const Color(0x447C5CFF),
+              blurRadius: widget.size * 0.36,
+              spreadRadius: widget.size * 0.05),
         ],
       ),
       child: AnimatedBuilder(
@@ -782,7 +785,10 @@ class OnboardScreen extends StatelessWidget {
 // ---------------------------------------------------------------------------
 
 class CreateWalletScreen extends StatefulWidget {
-  const CreateWalletScreen({super.key});
+  // replace: regenerating an existing wallet (compromised seed). Keeps the
+  // current PIN and returns to Home instead of running PIN onboarding.
+  const CreateWalletScreen({super.key, this.replace = false});
+  final bool replace;
   @override
   State<CreateWalletScreen> createState() => _CreateWalletScreenState();
 }
@@ -803,9 +809,18 @@ class _CreateWalletScreenState extends State<CreateWalletScreen> {
     try {
       await WalletService.instance.importMnemonic(_mnemonic);
       if (!mounted) return;
-      Navigator.of(context).pushReplacement(
-        MaterialPageRoute(builder: (_) => const SetPinScreen()),
-      );
+      if (widget.replace) {
+        // Seed swapped in place; existing PIN still guards the app.
+        showToast(context, 'Nouvelle wallet active.');
+        Navigator.of(context).pushAndRemoveUntil(
+          MaterialPageRoute(builder: (_) => const HomeScreen()),
+          (_) => false,
+        );
+      } else {
+        Navigator.of(context).pushReplacement(
+          MaterialPageRoute(builder: (_) => const SetPinScreen()),
+        );
+      }
     } catch (e) {
       setState(() => _saving = false);
       if (!mounted) return;
@@ -1301,11 +1316,31 @@ class _HomeScreenState extends State<HomeScreen> {
   BigInt _pol = BigInt.zero;
   bool _loading = true;
   String? _err;
+  List<Map<String, dynamic>> _rates = [];
+  String? _ratesDate;
 
   @override
   void initState() {
     super.initState();
     _refresh();
+    _loadRates();
+  }
+
+  // Parallel-market rates from the backend (scraped from squareportsaid.com).
+  // Independent of balances: a failure here just hides the card.
+  Future<void> _loadRates() async {
+    try {
+      final resp = await http
+          .get(Uri.parse('$kApiBase/rates'))
+          .timeout(const Duration(seconds: 15));
+      if (resp.statusCode != 200) return;
+      final j = jsonDecode(resp.body) as Map<String, dynamic>;
+      if (!mounted) return;
+      setState(() {
+        _rates = (j['rates'] as List).cast<Map<String, dynamic>>();
+        _ratesDate = j['date'] as String?;
+      });
+    } catch (_) {/* leave the card hidden */}
   }
 
   Future<void> _refresh() async {
@@ -1313,6 +1348,7 @@ class _HomeScreenState extends State<HomeScreen> {
       _loading = true;
       _err = null;
     });
+    _loadRates();
     try {
       final results = await Future.wait([
         WalletService.instance.usdtBalance(),
@@ -1340,9 +1376,11 @@ class _HomeScreenState extends State<HomeScreen> {
     final polStr = WalletService.formatAmount(_pol, 18, displayDp: 4);
     return Scaffold(
       appBar: AppBar(
-        titleSpacing: 20,
+        titleSpacing: 16,
         title: Row(
           children: [
+            const SpinningLogo(size: 34),
+            const SizedBox(width: 10),
             const Text('Tchipa',
                 style: TextStyle(fontWeight: FontWeight.w800, fontSize: 20)),
             Text(' Wallet',
@@ -1400,6 +1438,10 @@ class _HomeScreenState extends State<HomeScreen> {
             ],
             const SizedBox(height: 20),
             _actions(),
+            if (_rates.isNotEmpty) ...[
+              const SizedBox(height: 26),
+              _ratesCard(),
+            ],
             const SizedBox(height: 26),
             const Text('Actifs',
                 style: TextStyle(
@@ -1504,6 +1546,137 @@ class _HomeScreenState extends State<HomeScreen> {
               ),
             ),
           ),
+        ],
+      ),
+    );
+  }
+
+  static String _fmtRate(dynamic n) {
+    final d = (n as num).toDouble();
+    return d == d.roundToDouble()
+        ? d.toStringAsFixed(0)
+        : d.toString();
+  }
+
+  Widget _ratesCard() {
+    final usdt = _rates.firstWhere((r) => r['code'] == 'USDT',
+        orElse: () => const {});
+    final others = _rates.where((r) => r['code'] != 'USDT').toList();
+    return Container(
+      padding: const EdgeInsets.all(18),
+      decoration: cardDecoration(),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Text('Taux du Square',
+                  style: TextStyle(
+                      color: Colors.white,
+                      fontSize: 15,
+                      fontWeight: FontWeight.w700)),
+              const Spacer(),
+              if (_ratesDate != null)
+                Text(_ratesDate!,
+                    style: const TextStyle(color: kMuted, fontSize: 11)),
+            ],
+          ),
+          const SizedBox(height: 14),
+          if (usdt.isNotEmpty) _usdtFeature(usdt),
+          if (others.isNotEmpty) ...[
+            const SizedBox(height: 12),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: others.map(_rateChip).toList(),
+            ),
+          ],
+          const SizedBox(height: 12),
+          const Text('Marché parallèle · squareportsaid.com',
+              style: TextStyle(color: kMuted, fontSize: 10.5)),
+        ],
+      ),
+    );
+  }
+
+  // USDT shown first and biggest — it's what the wallet holds.
+  Widget _usdtFeature(Map<String, dynamic> r) {
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        gradient: LinearGradient(colors: [
+          kGreen.withValues(alpha: 0.16),
+          kGreen.withValues(alpha: 0.04),
+        ]),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: kGreen.withValues(alpha: 0.3)),
+      ),
+      child: Row(
+        children: [
+          Container(
+            width: 46,
+            height: 46,
+            alignment: Alignment.center,
+            decoration: const BoxDecoration(
+                color: Color(0xFF26A17B), shape: BoxShape.circle),
+            child: const Text('₮',
+                style: TextStyle(
+                    color: Colors.white,
+                    fontSize: 24,
+                    fontWeight: FontWeight.w800)),
+          ),
+          const SizedBox(width: 14),
+          const Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text('USDT',
+                  style: TextStyle(
+                      color: Colors.white,
+                      fontSize: 18,
+                      fontWeight: FontWeight.w800)),
+              Text('Tether · DZD',
+                  style: TextStyle(color: kMuted, fontSize: 12)),
+            ],
+          ),
+          const Spacer(),
+          Column(
+            crossAxisAlignment: CrossAxisAlignment.end,
+            children: [
+              Text(_fmtRate(r['buy']),
+                  style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 30,
+                      fontWeight: FontWeight.w900,
+                      height: 1)),
+              const SizedBox(height: 2),
+              Text('Achat · Vente ${_fmtRate(r['sell'])}',
+                  style: const TextStyle(color: kMuted, fontSize: 11.5)),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _rateChip(Map<String, dynamic> r) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      decoration: BoxDecoration(
+        color: kBg.withValues(alpha: 0.5),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: kStroke),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(r['code'] as String,
+              style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 13,
+                  fontWeight: FontWeight.w700)),
+          const SizedBox(width: 8),
+          Text('${_fmtRate(r['buy'])} / ${_fmtRate(r['sell'])}',
+              style: const TextStyle(color: kMuted, fontSize: 12.5)),
         ],
       ),
     );
@@ -1966,6 +2139,43 @@ class _ProfileScreenState extends State<ProfileScreen> {
     setState(() => _bio = v);
   }
 
+  // Compromised seed → mint a fresh wallet. Keeps the current PIN; the old
+  // address stays valid on-chain, so funds must be moved off it beforehand.
+  Future<void> _regenerate() async {
+    final authed = await _reauth();
+    if (!authed || !mounted) return;
+    final go = await showDialog<bool>(
+      context: context,
+      builder: (_) => AlertDialog(
+        backgroundColor: kCard,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
+        title: const Text('Régénérer la wallet ?',
+            style: TextStyle(color: Colors.white)),
+        content: const Text(
+          'Une nouvelle phrase de récupération et une nouvelle adresse seront '
+          'créées. L\'ancienne adresse reste valable sur la blockchain : si elle '
+          'est compromise, transférez d\'abord vos fonds, sinon ils y resteront. '
+          'Action irréversible.',
+          style: TextStyle(color: kMuted, height: 1.4),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Annuler', style: TextStyle(color: kMuted)),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Continuer', style: TextStyle(color: kGold)),
+          ),
+        ],
+      ),
+    );
+    if (go != true || !mounted) return;
+    Navigator.of(context).push(
+      MaterialPageRoute(builder: (_) => const CreateWalletScreen(replace: true)),
+    );
+  }
+
   Future<void> _delete() async {
     final ok = await showDialog<bool>(
       context: context,
@@ -2064,6 +2274,12 @@ class _ProfileScreenState extends State<ProfileScreen> {
               title: 'Changer le code',
               onTap: () => Navigator.of(context).push(MaterialPageRoute(
                   builder: (_) => const SetPinScreen(asChange: true))),
+            ),
+            _tile(
+              icon: Icons.autorenew,
+              title: 'Régénérer la wallet',
+              subtitle: 'Nouveau seed en cas de compromission',
+              onTap: _regenerate,
             ),
             const SizedBox(height: 20),
             _section('Réseau'),
